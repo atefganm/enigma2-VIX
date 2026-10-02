@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <lib/base/eerror.h>
@@ -196,6 +199,33 @@ bool gEGLDC::tryInitEGL(int version) {
 		return false;
 	}
 
+	// The context is current now: learn the GPU's size limits before anything
+	// sized to the canvas (shadow FBO, viewport, textures) is created. Only
+	// matters when the canvas exceeds them - see updatePhysicalSize().
+	{
+		GLint max_tex = 0, max_rb = 0;
+		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+		glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_rb);
+		m_gpu_max_tex = (max_tex > 0 && max_rb > 0) ? std::min((int)max_tex, (int)max_rb) : std::max((int)max_tex, (int)max_rb);
+#ifdef HAVE_EGL_CANVAS_SCALING
+		m_max_tex_size = m_gpu_max_tex;
+		eDebug("[gEGLDC] canvas scaling is ENABLED in this build (--enable-egl-canvas-scaling): GPU texture limit %d", m_max_tex_size);
+#else
+		// Canvas scaling not enabled for this build (see configure.ac's
+		// --enable-egl-canvas-scaling): leave the limit at 0 = "unlimited", which
+		// makes every size helper a no-op - the limits are only logged.
+		m_max_tex_size = 0;
+#endif
+		m_texture_manager.setMaxTextureSize(m_max_tex_size);
+		const char* renderer = (const char*)glGetString(GL_RENDERER);
+		eDebug("[gEGLDC] GL_RENDERER=%s GL_MAX_TEXTURE_SIZE=%d GL_MAX_RENDERBUFFER_SIZE=%d", renderer ? renderer : "(null)", (int)max_tex, (int)max_rb);
+		updatePhysicalSize(m_width, m_height);
+
+		m_straight_alpha_present = m_window_provider && m_window_provider->needsStraightAlphaPresent();
+		if (m_straight_alpha_present)
+			eDebug("[gEGLDC] present pass will un-premultiply the frame (compositor blends this window as straight alpha)");
+	}
+
 	if (m_use_shadow_fbo && !createShadowFramebuffer()) {
 		eDebug("[gEGLDC] failed to create shadow framebuffer.");
 		for (int i = 0; i < m_page_count; ++i)
@@ -218,6 +248,20 @@ bool gEGLDC::tryInitEGL(int version) {
 		const char* gl_ext = (const char*)glGetString(GL_EXTENSIONS);
 		eDebug("[gEGLDC] EGL_EXTENSIONS: %s", egl_ext ? egl_ext : "(null)");
 		eDebug("[gEGLDC] GL_EXTENSIONS: %s", gl_ext ? gl_ext : "(null)");
+
+		// Probe for buffer-age / damage support the driver might implement
+		// without advertising it (only the SDK headers declare these).
+		EGLint age = -1;
+		EGLBoolean age_ok = eglQuerySurface(m_egl_display, m_egl_surfaces[0], 0x313D /* EGL_BUFFER_AGE_KHR */, &age);
+		eDebug("[gEGLDC] probe: eglQuerySurface(EGL_BUFFER_AGE) ok=%d age=%d err=0x%x", (int)age_ok, (int)age, age_ok ? 0 : eglGetError());
+		eDebug("[gEGLDC] probe: eglSwapBuffersWithDamageKHR=%p eglSwapBuffersWithDamageEXT=%p eglSetDamageRegionKHR=%p eglPostSubBufferNV=%p",
+			(void*)eglGetProcAddress("eglSwapBuffersWithDamageKHR"), (void*)eglGetProcAddress("eglSwapBuffersWithDamageEXT"),
+			(void*)eglGetProcAddress("eglSetDamageRegionKHR"), (void*)eglGetProcAddress("eglPostSubBufferNV"));
+
+		const char* inv_env = getenv("ENIGMA_EGL_BLIT_INVALIDATE");
+		m_blit_invalidate = inv_env && atoi(inv_env) != 0;
+		if (m_blit_invalidate)
+			eDebug("[gEGLDC] shadow blit will glInvalidateFramebuffer() the window surface first (ENIGMA_EGL_BLIT_INVALIDATE)");
 	}
 
 	return true;
@@ -233,7 +277,7 @@ bool gEGLDC::tryInitEGL(int version) {
 bool gEGLDC::createShadowFramebuffer() {
 	glGenTextures(1, &m_shadow_texture);
 	glBindTexture(GL_TEXTURE_2D, m_shadow_texture);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_width, m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_phys_width, m_phys_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -258,7 +302,7 @@ bool gEGLDC::createShadowFramebuffer() {
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	eDebug("[gEGLDC] shadow framebuffer created (%dx%d).", m_width, m_height);
+	eDebug("[gEGLDC] shadow framebuffer created (%dx%d).", m_phys_width, m_phys_height);
 	return true;
 }
 
@@ -300,7 +344,7 @@ bool gEGLDC::initEGL() {
 	m_texture_manager.setDisplay(m_egl_display);
 
 	// 7. basic GL state
-	glViewport(0, 0, m_width, m_height);
+	glViewport(0, 0, m_phys_width, m_phys_height);
 	eglSwapInterval(m_egl_display, 1);
 
 	// GL_BLEND and GL_SCISSOR_TEST are left enabled for the lifetime of the
@@ -378,10 +422,92 @@ bool gEGLDC::initEGL() {
 	return true;
 }
 
+// See m_phys_width's comment (gegldc.h). A no-op (physical == logical, scale 1)
+// unless the canvas is larger than the GPU can create a texture/renderbuffer for.
+void gEGLDC::updatePhysicalSize(int logical_w, int logical_h) {
+	int pw = logical_w, ph = logical_h;
+	const bool fixed_window = m_window_provider && !m_window_provider->canResizeWindow() && m_native_width > 0 && m_native_height > 0;
+	if (fixed_window) {
+		// This platform's native window cannot be resized (see
+		// INativeWindowProvider::canResizeWindow()): whatever the canvas size,
+		// render into the size the window was created with. Independent of the
+		// GPU texture limit - a 720p canvas is scaled UP to the window just as a
+		// 1440p one is scaled down.
+		pw = m_native_width;
+		ph = m_native_height;
+	} else {
+		gtexFitSize(logical_w, logical_h, m_max_tex_size, pw, ph);
+	}
+	m_phys_width = pw;
+	m_phys_height = ph;
+	m_scale_x = logical_w > 0 ? (float)pw / (float)logical_w : 1.0f;
+	m_scale_y = logical_h > 0 ? (float)ph / (float)logical_h : 1.0f;
+	m_scaled = (pw != logical_w || ph != logical_h);
+	if (m_max_tex_size == 0 && m_gpu_max_tex > 0 && std::max(logical_w, logical_h) > m_gpu_max_tex)
+		eDebug("[gEGLDC] WARNING: canvas %dx%d exceeds the GPU texture limit %d but canvas scaling is NOT enabled in this build (configure --enable-egl-canvas-scaling / HAVE_EGL_CANVAS_SCALING) - textures wider/taller than the limit will be blank and the window resize will likely fail", logical_w, logical_h, m_gpu_max_tex);
+	if (isScaled() && fixed_window)
+		eDebug("[gEGLDC] native window cannot be resized on this platform - rendering canvas %dx%d scaled (%.3f x %.3f) into the existing %dx%d window", logical_w, logical_h, m_scale_x, m_scale_y, pw, ph);
+	else if (isScaled())
+		eDebug("[gEGLDC] canvas %dx%d exceeds GPU texture limit %d - rendering at %dx%d (scale %.3f x %.3f) and letting the display stretch it", logical_w, logical_h, m_max_tex_size, pw, ph, m_scale_x, m_scale_y);
+}
+
+void gEGLDC::uploadOverlayBand(GLuint tex_id, int left, int top, int right, int bottom) {
+	const int pw = m_pixmap->size().width();
+	const int ph = m_pixmap->size().height();
+	left = std::max(0, left);
+	top = std::max(0, top);
+	right = std::min(pw, right);
+	bottom = std::min(ph, bottom);
+	if (bottom <= top || right <= left)
+		return;
+
+	const uint8_t* base = (const uint8_t*)m_pixmap->surface->data;
+	const size_t stride = (size_t)pw * 4;
+
+	glBindTexture(GL_TEXTURE_2D, tex_id);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	// m_pixmap is natively BGRA in memory - see gtexture_manager.cpp's bpp==32
+	// branch / gles::needsRBSwap's comment (gles_version.h) for why this
+	// format token is platform-dependent.
+	const GLenum fmt = gles::needsRBSwap ? GL_RGBA : GL_BGRA_EXT;
+
+	// The overlay texture is created by gTextureManager, which shrinks anything
+	// over the GPU's texture limit with the same gtexFitSize() rule used here.
+	int tw = pw, th = ph;
+	gtexFitSize(pw, ph, m_texture_manager.maxTextureSize(), tw, th);
+	if (tw == pw && th == ph) {
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, top, pw, bottom - top, fmt, GL_UNSIGNED_BYTE, base + (size_t)top * stride);
+		return;
+	}
+
+	const float sx = (float)tw / (float)pw;
+	const float sy = (float)th / (float)ph;
+	const int dx0 = std::max(0, (int)std::floor(left * sx));
+	const int dx1 = std::min(tw, (int)std::ceil(right * sx));
+	const int dy0 = std::max(0, (int)std::floor(top * sy));
+	const int dy1 = std::min(th, (int)std::ceil(bottom * sy));
+	if (dx1 <= dx0 || dy1 <= dy0)
+		return;
+	std::vector<uint32_t> small((size_t)(dx1 - dx0) * (size_t)(dy1 - dy0));
+	gtexDownscaleBGRA((const uint32_t*)base, pw, pw, ph, left, top, right, bottom, small.data(), tw, th, dx0, dy0, dx1, dy1);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, dx0, dy0, dx1 - dx0, dy1 - dy0, fmt, GL_UNSIGNED_BYTE, small.data());
+}
+
 void gEGLDC::setGlScissor(const eRect& rect) {
-	int sx = rect.x();
-	int sy = m_height - (rect.y() + rect.height());
-	glScissor(sx, sy, rect.width(), rect.height());
+	if (!isScaled()) {
+		int sx = rect.x();
+		int sy = m_height - (rect.y() + rect.height());
+		glScissor(sx, sy, rect.width(), rect.height());
+		return;
+	}
+
+	// Logical (top-down) rect -> physical (bottom-up) pixels. Rounded outwards
+	// so a scaled-down edge never loses its partially covered pixel row/column.
+	int x0 = std::max(0, (int)std::floor(rect.x() * m_scale_x));
+	int x1 = std::min(m_phys_width, (int)std::ceil((rect.x() + rect.width()) * m_scale_x));
+	int y0 = std::max(0, (int)std::floor(rect.y() * m_scale_y));
+	int y1 = std::min(m_phys_height, (int)std::ceil((rect.y() + rect.height()) * m_scale_y));
+	glScissor(x0, m_phys_height - y1, std::max(0, x1 - x0), std::max(0, y1 - y0));
 }
 
 void gEGLDC::setAlphaBlendMode(bool trueAlphaBlend) {
@@ -420,7 +546,41 @@ void gEGLDC::setAlphaBlendMode(bool trueAlphaBlend) {
 		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
 }
 
+// Diagnostic ONLY: ENIGMA_EGL_SKIP_DRAW=fill,rect,blit,text (any subset) makes
+// that class of draw a no-op, so combined with ENIGMA_EGL_PROFILE_FINISH the
+// drop in the logged GPU drain time attributes the frame's GPU cost to it. The
+// screen renders wrongly by design - never ship it enabled.
+enum { SKIP_FILL = 1, SKIP_RECT = 2, SKIP_BLIT = 4, SKIP_TEXT = 8 };
+static unsigned skipDrawMask() {
+	static const unsigned mask = []() {
+		unsigned m = 0;
+		if (const char* e = getenv("ENIGMA_EGL_SKIP_DRAW")) {
+			if (strstr(e, "fill")) m |= SKIP_FILL;
+			if (strstr(e, "rect")) m |= SKIP_RECT;
+			if (strstr(e, "blit")) m |= SKIP_BLIT;
+			if (strstr(e, "text")) m |= SKIP_TEXT;
+			eDebug("[gEGLDC] DIAGNOSTIC skip-draw mask=%u (from ENIGMA_EGL_SKIP_DRAW=%s) - display will be wrong", m, e);
+		}
+		return m;
+	}();
+	return mask;
+}
+
+// Texture deletion order. DEFAULT = the original behaviour: queued texture
+// deletions are processed BEFORE the pending blit batch is drawn. Setting
+// ENIGMA_EGL_FLUSH_BEFORE_DELETE=1 opts into drawing the pending batch first
+// (plus an extra flush in executeBlit()). That was meant to stop a picon whose
+// texture was deleted before its batch drew from rendering black, but on real
+// hardware it caused stale selections and broken redraws, so it is off unless
+// explicitly requested for testing.
+static bool legacyTexDeletion() {
+	static const bool opt_in = getenv("ENIGMA_EGL_FLUSH_BEFORE_DELETE") && atoi(getenv("ENIGMA_EGL_FLUSH_BEFORE_DELETE")) != 0;
+	return !opt_in;
+}
+
 void gEGLDC::drawFlatRects(const gRegion& clip, float r, float g, float b, float a) {
+	if (skipDrawMask() & SKIP_FILL)
+		return;
 	unsigned int count = clip.rects.size();
 	if (count == 0)
 		return;
@@ -516,7 +676,7 @@ void gEGLDC::executeRectangle(const gOpcode* op) {
 	// below, which grc.cpp's equivalent also reaches unconditionally since
 	// the reset there runs after gPixmap::drawRectangle() regardless of
 	// whether that call's region ended up empty).
-	if (m_current_clip.rects.empty()) {
+	if (m_current_clip.rects.empty() || (skipDrawMask() & SKIP_RECT)) {
 		m_border_width = 0;
 		m_radius = 0;
 		m_radius_edges = 0;
@@ -572,26 +732,203 @@ void gEGLDC::executeRectangle(const gOpcode* op) {
 		const float alpha = 1.0f - (m_background_color_rgb.a / 255.0f);
 		auto drawPass = [&](bool coverage_alpha) {
 			for (unsigned int i = 0; i < m_current_clip.rects.size(); ++i) {
+				if (m_profile) {
+					const eRect& cr = m_current_clip.rects[i];
+					float ix = std::max(0.0f, std::min((float)(cr.left() + cr.width()), x + w) - std::max((float)cr.left(), x));
+					float iy = std::max(0.0f, std::min((float)(cr.top() + cr.height()), y + h) - std::max((float)cr.top(), y));
+					m_prof.rect_adv_draws++;
+					m_prof.rect_adv_mpx += (double)ix * iy / 1e6;
+				}
 				setGlScissor(m_current_clip.rects[i]);
 				m_advanced_shader.drawAdvancedRect(x, y, w, h, m_radius, m_radius_edges, m_gradient_colors, m_gradient_orientation, m_gradient_alphablend > 0, alpha,
 												   m_background_color_rgb, m_border_width, m_border_color, coverage_alpha);
 			}
 		};
 
-		if (accumulate || opaque) {
-			setAlphaBlendMode(true);
-			drawPass(false);
+		// Fast path (ENIGMA_EGL_RECT_FASTPATH=0 disables, for A/B): profiling
+		// on gbquad4kpro (advShadedMpx vs GPU drain time) showed the advanced
+		// shader costs ~10ns/pixel, and translucent rounded/gradient panels
+		// run it over their whole area (twice) although coverage is exactly 1
+		// everywhere except the corner squares. Instead: the interior
+		// (everything outside the rounded corners' r x r squares) is drawn
+		// with the cheap flat shader, its colour - solid or piecewise-linear
+		// gradient, which vertex-colour interpolation reproduces exactly -
+		// baked into the vertices; only the corner squares still go through
+		// the advanced shader. Borders, degenerate gradients and radii larger
+		// than half the rect keep the original path.
+		static const bool s_rect_fastpath = !(getenv("ENIGMA_EGL_RECT_FASTPATH") && atoi(getenv("ENIGMA_EGL_RECT_FASTPATH")) == 0);
+		const size_t nstops = m_gradient_colors.size();
+		const bool fast = s_rect_fastpath && m_border_width <= 0 && (nstops == 0 || (nstops >= 2 && nstops <= 16)) && w > 0 && h > 0 &&
+						  (m_radius <= 0 || 2.0f * m_radius <= std::min(w, h));
+
+		if (fast) {
+			const float rad = m_radius > 0 ? (float)m_radius : 0.0f;
+			const bool c_tl = rad > 0 && (m_radius_edges & 1), c_tr = rad > 0 && (m_radius_edges & 2);
+			const bool c_bl = rad > 0 && (m_radius_edges & 4), c_br = rad > 0 && (m_radius_edges & 8);
+			const bool one_pass = accumulate || opaque;
+			const bool grad_alphablend = m_gradient_alphablend > 0;
+
+			// Mirrors the advanced fragment shader's colour (see
+			// gadvanced_shader.cpp) at a position where coverage == 1.
+			auto colorAt = [&](float px, float py, float out[4]) {
+				float sr = m_background_color_rgb.r / 255.0f, sg = m_background_color_rgb.g / 255.0f, sb = m_background_color_rgb.b / 255.0f;
+				out[0] = sr; out[1] = sg; out[2] = sb; out[3] = alpha;
+				if (nstops == 0)
+					return;
+				float t = m_gradient_orientation == 1 ? (px - x) / w : (py - y) / h;
+				t = std::min(1.0f, std::max(0.0f, t));
+				const float scaled = t * (float)(nstops - 1);
+				size_t i = std::min((size_t)scaled, nstops - 2);
+				const float f = scaled - (float)i;
+				auto stopColor = [&](size_t k, float c[4]) {
+					const gRGB& g = m_gradient_colors[k];
+					c[0] = g.r / 255.0f; c[1] = g.g / 255.0f; c[2] = g.b / 255.0f;
+					c[3] = grad_alphablend ? alpha : (1.0f - (g.a / 255.0f));
+				};
+				float c0[4], c1[4], gc[4];
+				stopColor(i, c0);
+				stopColor(i + 1, c1);
+				for (int k = 0; k < 4; ++k)
+					gc[k] = c0[k] + (c1[k] - c0[k]) * f;
+				if (grad_alphablend) {
+					out[0] = sr + (gc[0] - sr) * gc[3];
+					out[1] = sg + (gc[1] - sg) * gc[3];
+					out[2] = sb + (gc[2] - sb) * gc[3];
+				} else {
+					out[0] = gc[0]; out[1] = gc[1]; out[2] = gc[2]; out[3] = gc[3];
+				}
+			};
+
+			std::vector<float> verts;
+			verts.reserve(64 * 36);
+			auto flushVerts = [&]() {
+				if (!verts.empty()) {
+					m_basic_shader.drawBatch(verts.data(), (int)(verts.size() / 6));
+					verts.clear();
+				}
+			};
+			auto pushQuad = [&](float ax, float ay, float bx, float by) {
+				float c00[4], c10[4], c01[4], c11[4];
+				colorAt(ax, ay, c00); colorAt(bx, ay, c10); colorAt(ax, by, c01); colorAt(bx, by, c11);
+				const float* cs[6] = {c00, c01, c10, c10, c01, c11};
+				const float xs[6] = {ax, ax, bx, bx, ax, bx};
+				const float ys[6] = {ay, by, ay, ay, by, by};
+				for (int k = 0; k < 6; ++k) {
+					verts.push_back(xs[k]); verts.push_back(ys[k]);
+					verts.insert(verts.end(), cs[k], cs[k] + 4);
+				}
+				if (verts.size() >= (size_t)gShader::kMaxBatchQuads * 36 - 36)
+					flushVerts();
+			};
+			// One piece, split at gradient stop boundaries along the gradient axis.
+			auto pushPiece = [&](float x0, float y0, float x1, float y1) {
+				if (x1 <= x0 || y1 <= y0)
+					return;
+				if (nstops < 2) {
+					pushQuad(x0, y0, x1, y1);
+					return;
+				}
+				const bool horiz = m_gradient_orientation == 1;
+				const float lo = horiz ? x0 : y0, hi = horiz ? x1 : y1;
+				const float origin = horiz ? x : y, span = horiz ? w : h;
+				float prev = lo;
+				for (size_t s = 1; s + 1 <= nstops - 1; ++s) {
+					float b = origin + span * (float)s / (float)(nstops - 1);
+					if (b > prev && b < hi) {
+						if (horiz) pushQuad(prev, y0, b, y1); else pushQuad(x0, prev, x1, b);
+						prev = b;
+					}
+				}
+				if (horiz) pushQuad(prev, y0, hi, y1); else pushQuad(x0, prev, x1, hi);
+			};
+
+			// Interior = middle band + the strips above/below it between the corner squares.
+			const float rt = (c_tl || c_tr) ? rad : 0.0f, rb = (c_bl || c_br) ? rad : 0.0f;
+			struct Piece { float x0, y0, x1, y1; };
+			Piece pieces[3];
+			int npieces = 0;
+			pieces[npieces++] = {x, y + rt, x + w, y + h - rb};
+			if (rt > 0)
+				pieces[npieces++] = {x + (c_tl ? rad : 0.0f), y, x + w - (c_tr ? rad : 0.0f), y + rt};
+			if (rb > 0)
+				pieces[npieces++] = {x + (c_bl ? rad : 0.0f), y + h - rb, x + w - (c_br ? rad : 0.0f), y + h};
+
+			if (one_pass)
+				setAlphaBlendMode(true);
+			else
+				glDisable(GL_BLEND);
+			// Geometry is clipped to each clip rect below, so the scissor must be a no-op (see drawFlatRects()).
+			setGlScissor(eRect(0, 0, m_width, m_height));
+			for (const eRect& cr : m_current_clip.rects) {
+				const float cl = cr.left(), ct = cr.top(), cr_r = cr.left() + cr.width(), cb = cr.top() + cr.height();
+				for (int p = 0; p < npieces; ++p)
+					pushPiece(std::max(pieces[p].x0, cl), std::max(pieces[p].y0, ct), std::min(pieces[p].x1, cr_r), std::min(pieces[p].y1, cb));
+			}
+			flushVerts();
+			if (!one_pass)
+				glEnable(GL_BLEND);
+
+			if (m_profile)
+				m_prof.rect_fast++;
+
+			if (rad > 0) {
+				const float corner[4][4] = {{x, y, rad, rad}, {x + w - rad, y, rad, rad}, {x, y + h - rad, rad, rad}, {x + w - rad, y + h - rad, rad, rad}};
+				const bool present[4] = {c_tl, c_tr, c_bl, c_br};
+				auto cornerPass = [&](bool coverage_alpha) {
+					for (const eRect& cr : m_current_clip.rects) {
+						for (int c = 0; c < 4; ++c) {
+							if (!present[c])
+								continue;
+							const float* q = corner[c];
+							if (q[0] >= cr.left() + cr.width() || q[0] + q[2] <= cr.left() || q[1] >= cr.top() + cr.height() || q[1] + q[3] <= cr.top())
+								continue;
+							if (m_profile) {
+								m_prof.rect_adv_draws++;
+								m_prof.rect_adv_mpx += (double)q[2] * q[3] / 1e6;
+							}
+							setGlScissor(cr);
+							m_advanced_shader.drawAdvancedRect(x, y, w, h, m_radius, m_radius_edges, m_gradient_colors, m_gradient_orientation, grad_alphablend, alpha, m_background_color_rgb,
+															   m_border_width, m_border_color, coverage_alpha, q);
+						}
+					}
+				};
+				if (one_pass) {
+					setAlphaBlendMode(true);
+					cornerPass(false);
+				} else {
+					glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+					cornerPass(true);
+					glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+					glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ONE);
+					cornerPass(false);
+					glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+					setAlphaBlendMode(true);
+				}
+			} else if (!one_pass) {
+				setAlphaBlendMode(true);
+			}
 		} else {
-			// Pass 1: shader alpha = coverage. rgb = c*cov + dst*(1-cov),
-			// dst alpha *= (1-cov).
-			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
-			drawPass(true);
-			// Pass 2, alpha only: shader alpha = a*cov, added on top.
-			glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-			glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ONE);
-			drawPass(false);
-			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-			setAlphaBlendMode(true);
+			if (m_profile) {
+				if (accumulate || opaque)
+					m_prof.rect_adv1++;
+				else
+					m_prof.rect_adv2++;
+			}
+			if (accumulate || opaque) {
+				setAlphaBlendMode(true);
+				drawPass(false);
+			} else {
+				// Pass 1: shader alpha = coverage. rgb = c*cov + dst*(1-cov),
+				// dst alpha *= (1-cov).
+				glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+				drawPass(true);
+				// Pass 2, alpha only: shader alpha = a*cov, added on top.
+				glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+				glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ONE);
+				drawPass(false);
+				glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+				setAlphaBlendMode(true);
+			}
 		}
 	} else {
 		float r = m_background_color_rgb.r / 255.0f;
@@ -603,6 +940,8 @@ void gEGLDC::executeRectangle(const gOpcode* op) {
 		// a plain flat-color rectangle, to match the CPU renderer's raw
 		// overwrite semantics.
 		glDisable(GL_BLEND);
+		if (m_profile)
+			m_prof.rect_flat++;
 		for (unsigned int i = 0; i < m_current_clip.rects.size(); ++i) {
 			setGlScissor(m_current_clip.rects[i]);
 			m_basic_shader.drawRect(op->parm.rectangle->area.x() + m_current_offset.x(), op->parm.rectangle->area.y() + m_current_offset.y(), op->parm.rectangle->area.width(),
@@ -698,12 +1037,9 @@ void gEGLDC::executeClear(const gOpcode* op) {
 			for (int y = top; y < bottom; ++y)
 				memset(base + (size_t)y * stride + (size_t)left * 4, 0, (size_t)(right - left) * 4);
 
-			glBindTexture(GL_TEXTURE_2D, overlay_tex);
-			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-			// m_pixmap is natively BGRA in memory - see gtexture_manager.cpp's
-			// bpp==32 branch / gles::needsRBSwap's comment (gles_version.h)
-			// for why this format token is platform-dependent.
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, top, pw, bottom - top, gles::needsRBSwap ? GL_RGBA : GL_BGRA_EXT, GL_UNSIGNED_BYTE, base + (size_t)top * stride);
+			// Uploads rows [top, bottom) of m_pixmap (natively BGRA - see
+			// uploadOverlayBand()), downsampled if the texture is smaller.
+			uploadOverlayBand(overlay_tex, left, top, right, bottom);
 
 			setGlScissor(eRect(left, top, right - left, bottom - top));
 			m_texture_shader.drawTexture(0, 0, (float)m_width, (float)m_height, overlay_tex);
@@ -763,14 +1099,25 @@ void gEGLDC::executeBlit(const gOpcode* opcode) {
 	// leak). This guard's destructor runs on every exit path below,
 	// including every early return, so it always releases exactly the one
 	// reference/allocation this specific opcode is responsible for.
+	//
+	// The same guard also does what gDC::exec()'s generic blit case does after
+	// every blit (grc.cpp): reset the one-shot corner radius that
+	// gPainter::setRadius() queued for it. Without that reset a rounded blit
+	// (e.g. a poster with cornerRadius) left m_radius set, and the next blit -
+	// say an icon in a listbox row redrawn after the poster changed - was drawn
+	// with that stale radius, rounded into a distorted blob.
 	struct BlitOpcodeGuard {
 		const gOpcode::para::pblit* op;
+		int& radius;
+		uint8_t& radius_edges;
 		~BlitOpcodeGuard() {
+			radius = 0;
+			radius_edges = 0;
 			if (op->pixmap)
 				op->pixmap->Release();
 			delete op;
 		}
-	} guard{op};
+	} guard{op, m_radius, m_radius_edges};
 
 	if (!op->pixmap)
 		return;
@@ -794,6 +1141,11 @@ void gEGLDC::executeBlit(const gOpcode* opcode) {
 	// going through PixmapCache) would hit on every navigation step. Cheap
 	// when there's nothing queued (a mutex lock + empty check - see
 	// gTextureManager::processDeletions()), so safe to call this often.
+	// A pending batch (quads queued but not yet drawn) may reference a texture
+	// that is queued for deletion - draw it first, or that draw would sample a
+	// deleted texture (black) or one whose id getTexture() below just reused.
+	if (!legacyTexDeletion() && m_texture_manager.hasPendingDeletions())
+		flushBlitBatch();
 	m_texture_manager.processDeletions();
 
 	GLuint tex_id = m_texture_manager.getTexture(op->pixmap);
@@ -959,6 +1311,11 @@ void gEGLDC::flushBlitBatch() {
 	if (m_blit_batch_buffer.empty())
 		return;
 
+	if (skipDrawMask() & SKIP_BLIT) {
+		m_blit_batch_buffer.clear();
+		return;
+	}
+
 	if (m_blit_batch_blend) {
 		setAlphaBlendMode(m_blit_batch_true_alpha);
 		glEnable(GL_BLEND);
@@ -1058,7 +1415,7 @@ void gEGLDC::flushTextBatch() {
 	// m_text_batch_clip, not m_current_clip - see its declaration comment:
 	// this batch must be scissored against the clip captured when it
 	// started, not whatever the active clip happens to be right now.
-	if (m_text_batch_clip.rects.empty()) {
+	if (m_text_batch_clip.rects.empty() || (skipDrawMask() & SKIP_TEXT)) {
 		m_text_batch_buffer.clear();
 		return;
 	}
@@ -1081,6 +1438,9 @@ void gEGLDC::flushTextBatch() {
 
 	gPixmap* atlas_pix = m_font_atlas.getPixmap();
 	GLuint tex_id = m_texture_manager.getTexture(atlas_pix);
+	// Updated in place by row (glTexSubImage2D) - must never be evicted.
+	if (atlas_pix && atlas_pix->surface)
+		atlas_pix->surface->gl_texture_pinned = true;
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, tex_id);
 
@@ -1276,16 +1636,10 @@ void gEGLDC::compositeTextOverlay(eRect area, bool trueAlphaBlend) {
 	GLuint tex_id = m_pixmap->surface->gl_texture_id;
 	if (tex_id == 0) {
 		tex_id = m_texture_manager.getTexture(m_pixmap);
+		// CPU text-overlay staging texture, updated in place - never evict.
+		m_pixmap->surface->gl_texture_pinned = true;
 	} else {
-		glBindTexture(GL_TEXTURE_2D, tex_id);
-		int row_width = m_pixmap->size().width();
-		const uint8_t* src = (const uint8_t*)m_pixmap->surface->data;
-		src += (size_t)area.top() * row_width * 4;
-		// m_pixmap is natively BGRA in memory (see gtexture_manager.cpp's
-		// bpp==32 branch / gles::needsRBSwap's comment, gles_version.h, for
-		// why this format token is platform-dependent).
-		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, area.top(), row_width, area.height(), gles::needsRBSwap ? GL_RGBA : GL_BGRA_EXT, GL_UNSIGNED_BYTE, src);
+		uploadOverlayBand(tex_id, area.left(), area.top(), area.left() + area.width(), area.top() + area.height());
 	}
 	if (tex_id) {
 		// m_pixmap is only valid within the text's own bounding area - the
@@ -1318,6 +1672,22 @@ void gEGLDC::compositeTextOverlay(eRect area, bool trueAlphaBlend) {
 }
 
 void gEGLDC::enableSpinner() {
+	// gDC::enableSpinner() (grc.cpp) is about to do
+	// "m_spinner_saved->blit(*m_pixmap, ...)" to remember what's under the
+	// spinner for every later restore - written for a backend where
+	// m_pixmap IS the real displayed framebuffer (gFBDC), so that blit
+	// captures genuine on-screen pixels there. Not true here (see this
+	// class's constructor: m_pixmap is only ever a CPU staging buffer for
+	// text on this backend) - without first overwriting m_pixmap's spinner
+	// rect with a real GPU readback, that save captures whatever m_pixmap
+	// already held there (normally nothing, fully transparent), and every
+	// later destructive composite (see compositeTextOverlay(..., false)
+	// below and in incrementSpinner()/disableSpinner() - the deliberate fix
+	// for the spinner otherwise ghosting between frames) paints that
+	// emptiness straight over the real screen: the spinner appeared to
+	// punch a transparent hole through whatever was on screen instead of
+	// animating over it. See captureBackgroundIntoPixmap()'s own comment.
+	captureBackgroundIntoPixmap(m_spinner_pos);
 	gDC::enableSpinner();
 	// m_spinner_pos is a screen-absolute rect (the spinner is a global
 	// overlay, not part of any widget's offset-relative coordinate space),
@@ -1326,10 +1696,11 @@ void gEGLDC::enableSpinner() {
 	//
 	// false, not the default true - see disableSpinner()'s comment. This
 	// first frame's m_pixmap content is already the full background+icon
-	// composite (gDC::enableSpinner() just built it), not translucent
-	// content to layer over whatever the GPU target previously held there,
-	// so it needs the same unconditional-overwrite blend disableSpinner()
-	// and incrementSpinner() use.
+	// composite (gDC::enableSpinner() just built it, from the real
+	// background captureBackgroundIntoPixmap() just seeded it with), not
+	// translucent content to layer over whatever the GPU target previously
+	// held there, so it needs the same unconditional-overwrite blend
+	// disableSpinner() and incrementSpinner() use.
 	compositeTextOverlay(m_spinner_pos, false);
 }
 
@@ -1595,17 +1966,33 @@ void gEGLDC::exec(const gOpcode* opcode) {
 			// - freeing a texture a few opcodes later than the very next
 			// one after its pixmap died is harmless, so this only needs to
 			// happen once per real frame boundary, same as flip() itself.
-			m_texture_manager.processDeletions();
-			flushBlitBatch();
-			flushTextBatch();
+			// Batches first: a pending blit batch may still reference a
+			// texture that is queued for deletion (its pixmap's last ref was
+			// dropped by executeBlit()'s own guard) - deleting it before
+			// that batch is drawn renders the picture black.
+			if (legacyTexDeletion()) {
+				m_texture_manager.processDeletions();
+				flushBlitBatch();
+				flushTextBatch();
+			} else {
+				flushBlitBatch();
+				flushTextBatch();
+				m_texture_manager.processDeletions();
+			}
 			flip();
 			gDC::exec(opcode);
 			break;
 
 		case gOpcode::flip:
-			m_texture_manager.processDeletions();
-			flushBlitBatch();
-			flushTextBatch();
+			if (legacyTexDeletion()) {
+				m_texture_manager.processDeletions();
+				flushBlitBatch();
+				flushTextBatch();
+			} else {
+				flushBlitBatch();
+				flushTextBatch();
+				m_texture_manager.processDeletions();
+			}
 			flip();
 			gDC::exec(opcode);
 			break;
@@ -1647,6 +2034,23 @@ void gEGLDC::exec(const gOpcode* opcode) {
 
 gEGLDC* gEGLDC::s_instance = nullptr;
 
+// gDC::getRGB() (grc.cpp) resolves a palette-index colour (gColor) through
+// m_pixmap->surface->clut, and falls back to gRGB(col, col, col) - i.e. near
+// black - when there is no palette. gFBDC gives its 32bpp surface a 256-entry
+// palette for exactly this (gfbdc.cpp), because legacy painters such as
+// eGauge (needles), which call setPalette() and then pick colours by index,
+// depend on it. This backend's staging pixmap had none, so those colours all
+// rendered black. Same allocation as gFBDC: 256 zeroed entries, filled in by
+// the gOpcode::setPalette handling in gDC::exec().
+static void allocStagingPalette(gPixmap* pixmap) {
+	if (!pixmap || !pixmap->surface || pixmap->surface->clut.data)
+		return;
+	pixmap->surface->clut.colors = 256;
+	pixmap->surface->clut.start = 0;
+	pixmap->surface->clut.data = new gRGB[256];
+	memset(static_cast<void*>(pixmap->surface->clut.data), 0, sizeof(gRGB) * 256);
+}
+
 gEGLDC::gEGLDC(INativeWindowProvider* window_provider, int width, int height) : gMainDC() {
 	s_instance = this;
 	int xres = width, yres = height, bpp = 32;
@@ -1665,6 +2069,10 @@ gEGLDC::gEGLDC(INativeWindowProvider* window_provider, int width, int height) : 
 	m_window_provider = window_provider;
 	m_width = width;
 	m_height = height;
+	m_phys_width = width;
+	m_phys_height = height;
+	m_native_width = width;
+	m_native_height = height;
 	m_gles_version = 0;
 	m_egl_display = EGL_NO_DISPLAY;
 	for (int i = 0; i < MAX_EGL_SURFACES; ++i)
@@ -1683,6 +2091,7 @@ gEGLDC::gEGLDC(INativeWindowProvider* window_provider, int width, int height) : 
 	// calls (which assume the latter) operate on the wrong kind of texture
 	// object entirely - a very likely source of the wrong colors seen.
 	m_pixmap = new gPixmap(eSize(width, height), 32, gPixmap::accelNever);
+	allocStagingPalette(m_pixmap);
 }
 
 gEGLDC::~gEGLDC() {
@@ -1753,16 +2162,150 @@ void gEGLDC::setResolution(int xres, int yres, int bpp) {
 
 	m_width = xres;
 	m_height = yres;
-	// See the constructor for why accelNever is required here.
+	// See the constructor for why accelNever is required here. Safe to do
+	// immediately (unlike the GL/EGL work below) - plain CPU allocation, no
+	// GL context needed.
 	m_pixmap = new gPixmap(eSize(xres, yres), bpp, gPixmap::accelNever);
-	// The new pixmap has no gl_texture_id and no content yet - any area
-	// tracked from the old one is meaningless now.
+	allocStagingPalette(m_pixmap);
+
+	// See m_pending_resolution_change's comment (gegldc.h) for why the rest
+	// of this can't happen here: it's GL/EGL work, only valid on gRC's
+	// render thread, which this call (from Python - skin.py/PicturePlayer/
+	// VideoFinetune) is not running on. applyPendingResolutionChange(),
+	// called from the top of flip(), does it instead.
+	m_pending_width = xres;
+	m_pending_height = yres;
+	m_pending_resolution_change = true;
+}
+
+void gEGLDC::applyPendingResolutionChange() {
+	if (!m_pending_resolution_change)
+		return;
+	m_pending_resolution_change = false;
+
+	// The new pixmap (already swapped in by setResolution()) has no
+	// gl_texture_id and no content yet - any area tracked from the old one
+	// is meaningless now.
 	m_text_overlay_region = gRegion();
 
+	// Physical size first: everything below that touches the real GL targets
+	// (native window, surface, viewport, shadow FBO) uses it, while shader
+	// projections stay in the logical size. Equal to the pending size unless
+	// it exceeds the GPU's texture/renderbuffer limit. The previous physical
+	// size is kept as a fallback in case the driver refuses the new one.
+	const int prev_phys_w = m_phys_width;
+	const int prev_phys_h = m_phys_height;
+	updatePhysicalSize(m_pending_width, m_pending_height);
+
+	// Nothing about the real window/surface changed (the canvas is being
+	// rendered scaled to the size it already had): leave the native window and
+	// EGL surface completely alone and only update the GL state below.
+	m_log_frames_left = 5;
+	const bool physical_unchanged = (m_phys_width == prev_phys_w && m_phys_height == prev_phys_h);
+	if (physical_unchanged)
+		eDebug("[gEGLDC] physical size stays %dx%d for canvas %dx%d - native window and EGL surface left untouched", m_phys_width, m_phys_height, m_pending_width, m_pending_height);
+
+	// Nexus (or whichever platform's provider this is) needs to be told its
+	// window's own authored size changed too - see
+	// GbquadWindowProvider::onResolutionChanged() for why (stretch scales to
+	// whatever size Nexus was last told, not this canvas's actual current
+	// size). That size is the physical one, not the logical canvas.
+	if (m_window_provider && !physical_unchanged)
+		m_window_provider->onResolutionChanged(m_phys_width, m_phys_height);
+
+	// Confirmed on real hardware via a diagnostic eglQuerySurface() (now
+	// removed): the EGL window surface's real backing buffer does NOT
+	// follow onResolutionChanged() above - it stayed at the OLD size
+	// (matching fbClass's boot-time mode) while the canvas/shadow FBO/
+	// shaders were all correctly the NEW size, so flip()'s full-screen blit
+	// (dst rect = m_width/m_height, the NEW size) was silently clipping
+	// against a surface whose real bounds were still the OLD, smaller size.
+	//
+	// A first attempt at destroying and recreating m_egl_surfaces[0] here
+	// locked the box - this retry differs in one specific way: it releases
+	// the context from the surface first (eglMakeCurrent to EGL_NO_SURFACE)
+	// before destroying it, which the first attempt skipped. Destroying a
+	// surface that's still the current draw/read target is undefined
+	// behavior by the EGL spec even where a given driver happens to
+	// tolerate it, and NXPL/Nexus's driver plausibly doesn't - this is the
+	// standard, spec-correct release sequence used any time an EGL app
+	// resizes a window surface. Not a guaranteed fix (this driver's exact
+	// failure mode was never confirmed), but a real candidate rather than
+	// another blind guess.
+	if (isInitialized() && m_window_provider && !m_window_provider->usesPixmapSurface() && !physical_unchanged) {
+		eglMakeCurrent(m_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_egl_context);
+
+		if (m_egl_surfaces[0] != EGL_NO_SURFACE) {
+			eglDestroySurface(m_egl_display, m_egl_surfaces[0]);
+			m_egl_surfaces[0] = EGL_NO_SURFACE;
+		}
+
+		auto recreate_surface = [&]() -> bool {
+			EGLNativeWindowType native_window = m_window_provider->getNativeWindow();
+			m_egl_surfaces[0] = eglCreateWindowSurface(m_egl_display, m_egl_config, native_window, nullptr);
+			if (m_egl_surfaces[0] == EGL_NO_SURFACE) {
+				eDebug("[gEGLDC] eglCreateWindowSurface failed while applying resolution change to canvas %dx%d (physical %dx%d). EGL error: 0x%x", m_pending_width, m_pending_height, m_phys_width, m_phys_height, eglGetError());
+				return false;
+			}
+			// Best-effort, same as tryInitEGL()'s own attempt - doesn't
+			// change m_use_shadow_fbo, already decided once for this driver.
+			eglSurfaceAttrib(m_egl_display, m_egl_surfaces[0], EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED);
+			m_render_page = 0;
+			if (!eglMakeCurrent(m_egl_display, m_egl_surfaces[0], m_egl_surfaces[0], m_egl_context))
+				eDebug("[gEGLDC] eglMakeCurrent failed after recreating window surface for resolution change: 0x%x", eglGetError());
+
+			EGLint surf_w = -1, surf_h = -1;
+			eglQuerySurface(m_egl_display, m_egl_surfaces[0], EGL_WIDTH, &surf_w);
+			eglQuerySurface(m_egl_display, m_egl_surfaces[0], EGL_HEIGHT, &surf_h);
+			eDebug("[gEGLDC] after surface recreation: canvas=%dx%d, physical=%dx%d, EGL window surface now reports %dx%d",
+				m_pending_width, m_pending_height, m_phys_width, m_phys_height, (int)surf_w, (int)surf_h);
+			return true;
+		};
+
+		if (!recreate_surface() && (prev_phys_w != m_phys_width || prev_phys_h != m_phys_height) && prev_phys_w > 0 && prev_phys_h > 0) {
+			// The driver refused the new window size. Leaving the context with
+			// no surface at all means video with no UI, so retry at the size
+			// that was working before and render the new canvas scaled into it
+			// (aspect may differ from the canvas; this is only a fallback).
+			eDebug("[gEGLDC] falling back to the previous physical size %dx%d for canvas %dx%d", prev_phys_w, prev_phys_h, m_pending_width, m_pending_height);
+			m_phys_width = prev_phys_w;
+			m_phys_height = prev_phys_h;
+			m_scale_x = (float)prev_phys_w / (float)m_pending_width;
+			m_scale_y = (float)prev_phys_h / (float)m_pending_height;
+			m_scaled = true;
+			m_window_provider->onResolutionChanged(prev_phys_w, prev_phys_h);
+			recreate_surface();
+		}
+	}
+
 	if (isInitialized()) {
-		m_basic_shader.setResolution((float)m_width, (float)m_height);
-		m_texture_shader.setResolution((float)m_width, (float)m_height);
-		m_text_shader.setResolution((float)m_width, (float)m_height);
+		// Set once in initEGL() (right after context creation, same "basic GL
+		// state" step) and never touched again until now - a stale viewport
+		// still sized for the OLD resolution clips/rescales everything
+		// through the NDC-to-framebuffer-pixel transform after the shader
+		// projection matrices below already start mapping pixel coordinates
+		// to NDC using the NEW resolution: the two disagreeing is exactly
+		// what turns into elements clipped away entirely (anything outside
+		// the stale, smaller-or-differently-shaped viewport rect) or
+		// stretched/squashed wrong (anything inside it) - not just
+		// mispositioned, which the shader-matrix fix alone already covered.
+		glViewport(0, 0, m_phys_width, m_phys_height);
+
+		m_basic_shader.setResolution((float)m_pending_width, (float)m_pending_height);
+		m_advanced_shader.setResolution((float)m_pending_width, (float)m_pending_height);
+		m_texture_shader.setResolution((float)m_pending_width, (float)m_pending_height);
+		m_text_shader.setResolution((float)m_pending_width, (float)m_pending_height);
+	}
+
+	// m_shadow_fbo/m_shadow_texture were sized for whatever resolution was
+	// current when createShadowFramebuffer() first ran (initEGL(), against
+	// this canvas's construction-time size - see egl_init.cpp) and never
+	// resized since. Recreate at the new size, same as initEGL() does the
+	// first time.
+	if (m_use_shadow_fbo) {
+		destroyShadowFramebuffer();
+		if (!createShadowFramebuffer())
+			eDebug("[gEGLDC] failed to recreate shadow framebuffer at %dx%d after resolution change.", m_pending_width, m_pending_height);
 	}
 }
 
@@ -1786,8 +2329,8 @@ bool gEGLDC::gpuCopyPageContent(int from, int to) {
 	// with whatever rect the last opcode drawn set - reset it to the full
 	// surface first or this copy would silently only cover a leftover
 	// unrelated widget's clip rect instead of the whole page.
-	glScissor(0, 0, m_width, m_height);
-	glBlitFramebuffer(0, 0, m_width, m_height, 0, 0, m_width, m_height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glScissor(0, 0, m_phys_width, m_phys_height);
+	glBlitFramebuffer(0, 0, m_phys_width, m_phys_height, 0, 0, m_phys_width, m_phys_height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	return true;
 #else
 	(void)from;
@@ -1839,8 +2382,10 @@ void gEGLDC::releaseFrameTextures() {
 // content is undefined - the shadow FBO (or the preserved back buffer) is the
 // only place the complete frame is guaranteed to exist.
 void gEGLDC::serviceOsdCapture() {
-	const int width = m_width;
-	const int height = m_height;
+	// The real (physical) render target - when the canvas had to be scaled down
+	// to fit the GPU's limits, that is what actually exists to read back.
+	const int width = m_phys_width;
+	const int height = m_phys_height;
 	if (width <= 0 || height <= 0) {
 		m_osd_capture.fail();
 		return;
@@ -1867,11 +2412,121 @@ void gEGLDC::serviceOsdCapture() {
 	m_osd_capture.complete(pixels, width, height, gles::needsRBSwap);
 }
 
+// Reads back `rect` (clamped to the canvas) from whichever framebuffer
+// object currently holds this backend's real, presented content (same
+// shadow-FBO-or-0 selection as serviceOsdCapture() above) and writes it into
+// m_pixmap's own buffer at that exact rect, as top-down BGRA - m_pixmap's
+// byte convention regardless of gles::needsRBSwap (see compositeTextOverlay()'s
+// comment: the format token passed to glTexSubImage2D is what varies, not
+// the bytes' own order).
+//
+// Used by enableSpinner() (see its own comment) to give gDC's base-class
+// spinner save/restore logic (grc.cpp: enableSpinner()/incrementSpinner()/
+// disableSpinner(), all written for a backend where m_pixmap IS the real
+// displayed framebuffer - true for gFBDC, NOT for this one, see the
+// constructor's accelNever comment) something real to save. Without this,
+// m_spinner_saved captured whatever m_pixmap already held under the
+// spinner's rect - normally nothing (fully transparent), since this backend
+// only ever writes into m_pixmap via CPU-fallback text - so every
+// subsequent destructive composite (compositeTextOverlay(..., false), the
+// deliberate fix for the spinner icon otherwise ghosting/never fully
+// erasing between frames - see incrementSpinner()'s own comment) painted
+// that emptiness straight over the real GPU surface: the spinner appeared
+// to punch a transparent hole through whatever was on screen instead of
+// animating over it.
+void gEGLDC::captureBackgroundIntoPixmap(const eRect& rect) {
+	// Shouldn't be anything pending at this idle-loop call site (see the
+	// call site's comment), but a queued-and-not-yet-drawn batch would
+	// otherwise be invisible to the glReadPixels() below - cheap to guard
+	// unconditionally, same as every other GPU-state-reading spot in this
+	// file (e.g. compositeTextOverlay()'s own opening lines).
+	flushBlitBatch();
+	flushTextBatch();
+
+	const int pw = m_pixmap->size().width();
+	const int ph = m_pixmap->size().height();
+	const int left = std::max(0, rect.left());
+	const int top = std::max(0, rect.top());
+	const int right = std::min(pw, rect.left() + rect.width());
+	const int bottom = std::min(ph, rect.top() + rect.height());
+	const int w = right - left;
+	const int h = bottom - top;
+	if (w <= 0 || h <= 0)
+		return;
+
+	while (glGetError() != GL_NO_ERROR) {
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, m_use_shadow_fbo ? m_shadow_fbo : 0);
+
+	std::vector<uint8_t> pixels((size_t)w * (size_t)h * 4U);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	if (!isScaled()) {
+		// glReadPixels' y is measured from the BOTTOM of the framebuffer (GL
+		// convention) - m_height (the real GPU canvas), not ph (m_pixmap can
+		// briefly differ right after setResolution(), see there).
+		glReadPixels(left, m_height - top - h, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+	} else {
+		// Canvas is rendered scaled down: read the physical pixels covering
+		// the rect, then nearest-neighbour them back up to logical size so the
+		// conversion loop below (and m_pixmap) stay in logical coordinates.
+		const int px0 = std::max(0, (int)std::floor(left * m_scale_x));
+		const int px1 = std::min(m_phys_width, std::max(px0 + 1, (int)std::ceil(right * m_scale_x)));
+		const int py0 = std::max(0, (int)std::floor(top * m_scale_y));
+		const int py1 = std::min(m_phys_height, std::max(py0 + 1, (int)std::ceil(bottom * m_scale_y)));
+		const int rw = px1 - px0;
+		const int rh = py1 - py0;
+		std::vector<uint8_t> phys((size_t)rw * (size_t)rh * 4U);
+		glReadPixels(px0, m_phys_height - py1, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, phys.data());
+		for (int row = 0; row < h; ++row) { // row: 0 = bottom of the logical rect
+			const int ly = top + (h - 1 - row);
+			const int from_top = std::min(rh - 1, std::max(0, (int)(ly * m_scale_y) - py0));
+			const uint8_t* src_row = phys.data() + (size_t)(rh - 1 - from_top) * rw * 4U;
+			uint8_t* dst_row = pixels.data() + (size_t)row * w * 4U;
+			for (int col = 0; col < w; ++col) {
+				const int from_left = std::min(rw - 1, std::max(0, (int)((left + col) * m_scale_x) - px0));
+				memcpy(dst_row + (size_t)col * 4U, src_row + (size_t)from_left * 4U, 4U);
+			}
+		}
+	}
+
+	if (glGetError() != GL_NO_ERROR) {
+		eDebug("[gEGLDC] spinner background capture failed");
+		return; // m_pixmap keeps whatever it already held there - see call site
+	}
+
+	// Bottom-up GL rows -> top-down, and RGBA -> BGRA when this platform's
+	// render target isn't already pre-swapped - same conversion as
+	// gEGLOSDCapture::capture() (gosd_capture.cpp), which this mirrors.
+	uint8_t* dst_base = (uint8_t*)m_pixmap->surface->data;
+	const int dst_stride = pw * 4; // tightly packed - see clearOverlayArea()'s comment
+	const size_t row_bytes = (size_t)w * 4U;
+	for (int row = 0; row < h; ++row) {
+		const uint8_t* src_row = pixels.data() + (size_t)(h - 1 - row) * row_bytes;
+		uint8_t* dst_row = dst_base + (size_t)(top + row) * dst_stride + (size_t)left * 4;
+		memcpy(dst_row, src_row, row_bytes);
+	}
+	if (!gles::needsRBSwap) {
+		for (int row = 0; row < h; ++row) {
+			uint8_t* dst_row = dst_base + (size_t)(top + row) * dst_stride + (size_t)left * 4;
+			for (int x = 0; x < w; ++x)
+				std::swap(dst_row[x * 4 + 0], dst_row[x * 4 + 2]);
+		}
+	}
+}
+
 void gEGLDC::flip() {
+	// Defines "this frame" for the texture manager's LRU eviction.
+	m_texture_manager.nextFrame();
 	std::chrono::steady_clock::time_point prof_t0;
 	double prof_blit_ms = 0, prof_present_ms = 0;
 	if (m_profile)
 		prof_t0 = std::chrono::steady_clock::now();
+
+	// See m_pending_resolution_change's comment (gegldc.h) - must run before
+	// anything else below touches m_shadow_fbo/the shaders/the native
+	// window, all of which this may just have resized/recreated.
+	applyPendingResolutionChange();
 
 	if (m_osd_capture.isPending() && isInitialized())
 		serviceOsdCapture();
@@ -1976,7 +2631,7 @@ void gEGLDC::flip() {
 			// present nothing until unlocked.
 			if (!m_lock_cleared) {
 				glBindFramebuffer(GL_FRAMEBUFFER, 0);
-				glScissor(0, 0, m_width, m_height);
+				glScissor(0, 0, m_phys_width, m_phys_height);
 				glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 				glClear(GL_COLOR_BUFFER_BIT);
 				eglSwapBuffers(m_egl_display, m_egl_surfaces[0]);
@@ -1991,7 +2646,7 @@ void gEGLDC::flip() {
 			}
 			bool shadow_presented = false;
 #ifdef HAVE_GLES3
-			if (m_use_shadow_fbo && gles::isGLES3()) {
+			if (m_use_shadow_fbo && gles::isGLES3() && !m_straight_alpha_present) {
 				// MUST be a full-screen blit every single frame, regardless
 				// of what actually changed: eglSwapBuffers() on a surface
 				// that doesn't preserve content almost certainly cycles
@@ -2023,6 +2678,16 @@ void gEGLDC::flip() {
 						m_shadow_blit_frame, m_shadow_blit_stride, do_blit ? "BLIT" : "skip");
 
 				std::chrono::steady_clock::time_point blit_t0;
+				// Diagnostic (needs ENIGMA_EGL_PROFILE=1 too): ENIGMA_EGL_PROFILE_FINISH=1
+				// drains the GPU before timing the blit, so the frame's real
+				// GPU render time is logged as "finish" and blit= is then the
+				// pure copy cost. Adds a stall - never leave enabled.
+				static const bool s_prof_finish = getenv("ENIGMA_EGL_PROFILE_FINISH") && atoi(getenv("ENIGMA_EGL_PROFILE_FINISH")) != 0;
+				if (m_profile && s_prof_finish) {
+					std::chrono::steady_clock::time_point fin_t0 = std::chrono::steady_clock::now();
+					glFinish();
+					eDebug("[gEGLDC] profile: GPU render drain (finish)=%.2fms", msSince(fin_t0));
+				}
 				if (m_profile)
 					blit_t0 = std::chrono::steady_clock::now();
 				if (do_blit) {
@@ -2044,8 +2709,12 @@ void gEGLDC::flip() {
 					// real hardware even at stride 2).
 					glBindFramebuffer(GL_READ_FRAMEBUFFER, m_shadow_fbo);
 					glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-					glScissor(0, 0, m_width, m_height);
-					glBlitFramebuffer(0, 0, m_width, m_height, 0, 0, m_width, m_height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+					glScissor(0, 0, m_phys_width, m_phys_height);
+					if (m_blit_invalidate) {
+						const GLenum att = GL_COLOR;
+						glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &att);
+					}
+					glBlitFramebuffer(0, 0, m_phys_width, m_phys_height, 0, 0, m_phys_width, m_phys_height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 					glBindFramebuffer(GL_FRAMEBUFFER, m_shadow_fbo);
 				}
 				if (m_profile)
@@ -2055,20 +2724,42 @@ void gEGLDC::flip() {
 			}
 #endif
 			if (m_use_shadow_fbo && !shadow_presented) {
-				// GLES2 has no glBlitFramebuffer() - nothing has copied the
-				// shadow canvas into the window surface, so this swap
-				// presents whatever the surface already happened to hold.
-				// Not hit by any platform this backend currently ships for
-				// (the one window-surface provider needing the shadow path
-				// initialises GLES3 - see egl_init.cpp), flagged loudly
-				// rather than silently showing a blank/stale screen if that
-				// ever changes.
-				eDebug("[gEGLDC] shadow framebuffer active but no GLES3 present path available - screen will not update correctly.");
+				// GLES2 has no glBlitFramebuffer() (e.g. VU+ vuduo4kse/
+				// vusolo4k/vuultimo4k, whose libv3ddriver.so is GLES1/2-only
+				// - see configure.ac's GLES3 probe), so copy the shadow
+				// canvas into the window surface with a full-screen textured
+				// quad instead. Same full-frame-every-frame rule as the blit
+				// path above applies. m_shadow_texture is a GPU-rendered,
+				// bottom-up texture, whereas the quad geometry below follows
+				// gTextureShader::drawTexture()'s top-down CPU-texture
+				// convention - hence V is flipped (v=1 at y=0).
+				const float w = (float)m_width, h = (float)m_height;
+				const float quad[24] = {
+					0.0f, 0.0f, 0.0f, 1.0f,  0.0f, h,    0.0f, 0.0f,  w, 0.0f, 1.0f, 1.0f,
+					w,    0.0f, 1.0f, 1.0f,  0.0f, h,    0.0f, 0.0f,  w, h,    1.0f, 0.0f};
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+				glScissor(0, 0, m_phys_width, m_phys_height);
+				glDisable(GL_BLEND);
+				// A compositor that blends straight alpha would multiply the
+				// premultiplied frame by alpha a second time (translucent areas
+				// too dark) - convert to straight alpha on the way out.
+				m_texture_shader.setUnpremultiply(m_straight_alpha_present);
+				m_texture_shader.drawBatch(quad, 6, m_shadow_texture, 1.0f);
+				m_texture_shader.setUnpremultiply(false);
+				glEnable(GL_BLEND);
+				glBindFramebuffer(GL_FRAMEBUFFER, m_shadow_fbo);
 			}
 			std::chrono::steady_clock::time_point swap_t0;
 			if (m_profile)
 				swap_t0 = std::chrono::steady_clock::now();
-			eglSwapBuffers(m_egl_display, m_egl_surfaces[0]);
+			EGLBoolean swap_ok = eglSwapBuffers(m_egl_display, m_egl_surfaces[0]);
+			if (m_log_frames_left > 0) {
+				--m_log_frames_left;
+				const EGLint egl_err = eglGetError();
+				const GLenum gl_err = glGetError();
+				eDebug("[gEGLDC] frame presented after resolution change: swap=%d eglError=0x%x glError=0x%x canvas=%dx%d physical=%dx%d shadow=%d surface=%p", (int)swap_ok, (int)egl_err, (int)gl_err, m_width, m_height,
+					   m_phys_width, m_phys_height, m_use_shadow_fbo ? 1 : 0, (void*)m_egl_surfaces[0]);
+			}
 			if (m_profile)
 				prof_present_ms = msSince(swap_t0);
 		}
@@ -2085,6 +2776,8 @@ void gEGLDC::flip() {
 			gap_ms, m_prof.text_ops, m_prof.text_ms, m_prof.text_flushes, m_prof.text_flush_ms, m_prof.glyphs, m_prof.vbo_ms, m_prof.atlas_uploads, m_prof.atlas_rows, m_prof.atlas_ms,
 			m_prof.band_uploads, m_prof.band_rows, m_prof.band_ms, m_prof.overlays, m_prof.overlay_ms, m_prof.other_ops, m_prof.other_ms, prof_blit_ms, prof_present_ms, msSince(prof_t0),
 			gles::clientArrays ? 1 : 0);
+		eDebug("[gEGLDC] rects: flat=%d fast=%d adv1pass=%d adv2pass=%d advDraws=%d advShadedMpx=%.2f (screen=%.2fMpx)",
+			m_prof.rect_flat, m_prof.rect_fast, m_prof.rect_adv1, m_prof.rect_adv2, m_prof.rect_adv_draws, m_prof.rect_adv_mpx, (double)m_width * m_height / 1e6);
 		m_prof = FrameProfile();
 		m_prof_last_flip = std::chrono::steady_clock::now();
 	}
